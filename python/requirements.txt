@@ -1,0 +1,7 @@
+# Python deps for the OSC client's digital theremin.
+# Install with:    pip install -r requirements.txt
+#
+# (The OSC protocol code itself uses only the stdlib. These are only
+# needed to make the theremin actually produce sound.)
+sounddevice>=0.4
+numpy>=1.20
