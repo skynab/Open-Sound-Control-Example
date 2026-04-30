@@ -195,17 +195,17 @@ class OscServer:
         self.log.tag_config("err",  foreground="#c33")
 
     def _push_slider(self, parent, address, lo, hi, initial,
-                     name_var=None) -> None:
+                     name_var=None, display_label=None) -> None:
         """Build one push-slider row.
 
-        If `name_var` is provided, the label on the left becomes an
-        editable Entry bound to that StringVar. Pressing Enter or
-        clicking away commits the new name and pushes a
-        /server/rename/<slot> message to the last-seen client.
+        Label precedence: `name_var` (editable Entry) -> `display_label`
+        (static string for the user) -> `address` (the OSC address as a
+        last resort).
         """
         row = tk.Frame(parent); row.pack(fill="x", pady=2)
         if name_var is None:
-            tk.Label(row, text=address, width=15, anchor="w"
+            text = display_label if display_label is not None else address
+            tk.Label(row, text=text, width=15, anchor="w"
                      ).pack(side="left")
         else:
             entry = tk.Entry(row, textvariable=name_var, width=15,

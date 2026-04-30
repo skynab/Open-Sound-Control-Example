@@ -1,488 +1,588 @@
-// osc_client.cpp - OSC client with a small ANSI-terminal dashboard UI.
+// osc_client.cpp - FLTK GUI OSC client.
 //
-// Auto-cycles through a demo (frequency sweep, gain breath, LFO ramp,
-// transport toggle, periodic /hello) while a background thread reads
-// /ack replies from the server. The dashboard redraws in place, showing
-// the current state with progress bars and a scrolling log of sent (->)
-// and received (<-) messages.
+// Mirrors python/osc_client.py: blue banner, editable target address,
+// Frequency/Gain/LFO sliders (server can rename them), Theremin frame
+// with On/Off button + Test Sound + Pitch + Volume sliders driving a
+// real digital synth, action buttons, note trigger, and a log.
 //
-// Build: see Makefile (Linux/macOS: just `make`, Windows MinGW: -lws2_32).
-// Run:   ./osc_client                         (defaults 127.0.0.1 9000)
-//        ./osc_client 192.168.1.20 9000
-// Quit:  Ctrl+C
+// Build: needs FLTK (libfltk1.3-dev / brew install fltk / vcpkg fltk).
+// Audio uses the theremin.hpp backends (ALSA / CoreAudio / WinMM /
+// silent fallback). The Makefile auto-detects FLTK and the audio libs.
 
 #include "osc.hpp"
 #include "theremin.hpp"
 
+#include <FL/Fl.H>
+#include <FL/Fl_Window.H>
+#include <FL/Fl_Group.H>
+#include <FL/Fl_Box.H>
+#include <FL/Fl_Button.H>
+#include <FL/Fl_Toggle_Button.H>
+#include <FL/Fl_Input.H>
+#include <FL/Fl_Int_Input.H>
+#include <FL/Fl_Value_Slider.H>
+#include <FL/Fl_Text_Buffer.H>
+#include <FL/Fl_Text_Display.H>
+#include <FL/fl_draw.H>
+
 #include <atomic>
 #include <chrono>
-#include <cmath>
-#include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
-#include <iostream>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
-namespace ansi {
-constexpr const char* CLEAR  = "\033[2J";
-constexpr const char* HOME   = "\033[H";
-constexpr const char* HIDE   = "\033[?25l";
-constexpr const char* SHOW   = "\033[?25h";
-constexpr const char* RESET  = "\033[0m";
-constexpr const char* BOLD   = "\033[1m";
-constexpr const char* DIM    = "\033[2m";
-constexpr const char* GREEN  = "\033[32m";
-constexpr const char* CYAN   = "\033[36m";
-constexpr const char* YELLOW = "\033[33m";
-constexpr const char* RED    = "\033[31m";
-constexpr const char* CLR_EOL = "\033[K";  // clear to end of line
-}
+namespace {
 
-static std::atomic<bool> g_running{true};
-static void on_sigint(int) { g_running = false; }
+// ---- Application state ----------------------------------------------------
+struct AppState {
+    std::mutex mtx;
 
-// Shared state: log + currently-targeted destination. Both the input
-// thread and the main demo loop need to read/write the destination, so
-// it's mutex-protected.
-struct State {
-    mutable std::mutex mtx;
+    socket_t    sock      = OSC_INVALID_SOCKET;
     sockaddr_in dest{};
     std::string dest_host = "127.0.0.1";
     uint16_t    dest_port = 9000;
-    bool        paused = false;     // pause the demo loop
-    // Display names for the three core sliders (the server can rename
-    // them via /server/rename/{freq,gain,lfo}).
+    uint16_t    local_port = 0;
+
+    // Display names for the three core sliders. The server can rename
+    // them via /server/rename/{freq,gain,lfo} messages.
     std::string name_freq = "Frequency";
     std::string name_gain = "Gain";
     std::string name_lfo  = "LFO";
 
-    // Latest server-pushed values for the three core controls. Once set,
-    // the demo loop adopts them: the dashboard bar shows the server's
-    // value and the next /synth/* message echoes it back.
-    std::optional<float> server_freq;
-    std::optional<float> server_gain;
-    std::optional<float> server_lfo;
+    // Server-pushed values waiting to be applied to widgets on the main
+    // thread (we can't touch widgets from the recv thread directly).
+    std::optional<float> pending_freq;
+    std::optional<float> pending_gain;
+    std::optional<float> pending_lfo;
+    std::optional<float> pending_therm_pitch;
+    std::optional<float> pending_therm_volume;
+    std::optional<bool>  pending_play;
 
-    std::deque<std::string> log;
+    bool names_dirty = false;
 
-    void add_log(std::string line) {
-        std::lock_guard<std::mutex> lk(mtx);
-        log.push_back(std::move(line));
-        while (log.size() > 12) log.pop_front();
-    }
-    std::vector<std::string> log_snapshot() const {
-        std::lock_guard<std::mutex> lk(mtx);
-        return {log.begin(), log.end()};
-    }
-    sockaddr_in get_dest() const {
-        std::lock_guard<std::mutex> lk(mtx);
-        return dest;
-    }
+    std::deque<std::string> pending_log;
 };
 
-static std::string bar(double v, int width) {
-    if (v < 0.0) v = 0.0;
-    if (v > 1.0) v = 1.0;
-    int filled = static_cast<int>(v * width + 0.5);
-    std::string s = "[";
-    for (int i = 0; i < width; ++i) s += (i < filled ? "#" : "-");
-    s += "]";
-    return s;
+std::atomic<bool> g_running{true};
+AppState g_st;
+osc::Theremin* g_therm = nullptr;
+
+// ---- FLTK widgets ---------------------------------------------------------
+Fl_Window*       w_window         = nullptr;
+Fl_Input*        w_host_input     = nullptr;
+Fl_Input*        w_port_input     = nullptr;
+Fl_Box*          w_dest_status    = nullptr;
+Fl_Box*          w_name_freq_lbl  = nullptr;
+Fl_Box*          w_name_gain_lbl  = nullptr;
+Fl_Box*          w_name_lfo_lbl   = nullptr;
+Fl_Value_Slider* w_freq_slider    = nullptr;
+Fl_Value_Slider* w_gain_slider    = nullptr;
+Fl_Value_Slider* w_lfo_slider     = nullptr;
+Fl_Toggle_Button* w_therm_btn     = nullptr;
+Fl_Box*          w_therm_status   = nullptr;
+Fl_Value_Slider* w_therm_pitch    = nullptr;
+Fl_Value_Slider* w_therm_volume   = nullptr;
+Fl_Box*          w_audio_warning  = nullptr;
+Fl_Int_Input*    w_note_input     = nullptr;
+Fl_Int_Input*    w_vel_input      = nullptr;
+Fl_Text_Buffer*  w_log_buffer     = nullptr;
+Fl_Text_Display* w_log_display    = nullptr;
+
+// ---- Helpers --------------------------------------------------------------
+void log_line(const std::string& s) {
+    std::lock_guard<std::mutex> lk(g_st.mtx);
+    g_st.pending_log.push_back(s);
+    while (g_st.pending_log.size() > 500) g_st.pending_log.pop_front();
 }
 
-static std::string fmt_args(const osc::Message& m) {
-    std::ostringstream s;
-    for (size_t i = 0; i < m.args.size(); ++i) {
-        if (i) s << ", ";
-        const auto& a = m.args[i];
-        if      (auto p = std::get_if<int32_t>(&a))     s << *p << "i";
-        else if (auto p = std::get_if<float>(&a))       s << *p << "f";
-        else if (auto p = std::get_if<std::string>(&a)) s << '"' << *p << '"';
-        else if (auto p = std::get_if<bool>(&a))        s << (*p ? "true" : "false");
-        else if (auto p = std::get_if<osc::Blob>(&a))   s << "<blob " << p->size() << "B>";
+template <class Arg>
+void send_msg(const std::string& addr, const Arg& arg) {
+    socket_t sock; sockaddr_in dest;
+    {
+        std::lock_guard<std::mutex> lk(g_st.mtx);
+        sock = g_st.sock;
+        dest = g_st.dest;
     }
-    return s.str();
+    if (sock == OSC_INVALID_SOCKET) return;
+    osc::MessageBuilder b(addr); b.add(arg);
+    auto pkt = b.build();
+    osc::send_to(sock, dest, pkt);
+    std::ostringstream s;
+    s << "-> " << addr << "  ";
+    if constexpr (std::is_same_v<Arg, std::string>) s << "\"" << arg << "\"";
+    else if constexpr (std::is_same_v<Arg, bool>)   s << (arg ? "true" : "false");
+    else                                            s << arg;
+    log_line(s.str());
 }
 
-// Theremin + outgoing socket are global so the recv loop and input loop
-// can both reach them without threading them through every signature.
-static osc::Theremin* g_therm     = nullptr;        // set in main()
-static socket_t       g_send_sock = OSC_INVALID_SOCKET;
+void send_two_ints(const std::string& addr, int32_t a, int32_t b) {
+    socket_t sock; sockaddr_in dest;
+    {
+        std::lock_guard<std::mutex> lk(g_st.mtx);
+        sock = g_st.sock;
+        dest = g_st.dest;
+    }
+    if (sock == OSC_INVALID_SOCKET) return;
+    osc::MessageBuilder mb(addr); mb.add(a); mb.add(b);
+    osc::send_to(sock, dest, mb.build());
+    std::ostringstream s;
+    s << "-> " << addr << "  " << a << ", " << b;
+    log_line(s.str());
+}
 
-static void recv_loop(socket_t sock, State& st) {
+// ---- Receive thread -------------------------------------------------------
+void recv_loop() {
     std::vector<uint8_t> buf(65535);
     while (g_running) {
+        socket_t sock;
+        { std::lock_guard<std::mutex> lk(g_st.mtx); sock = g_st.sock; }
+        if (sock == OSC_INVALID_SOCKET) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
         sockaddr_in src{};
         socklen_t_compat slen = sizeof(src);
         int n = ::recvfrom(sock, reinterpret_cast<char*>(buf.data()),
                            static_cast<int>(buf.size()), 0,
                            reinterpret_cast<sockaddr*>(&src), &slen);
-        if (n <= 0) continue;  // timeout or transient error
+        if (n <= 0) continue;
+
         try {
             osc::Message m = osc::decode(buf.data(), static_cast<size_t>(n));
-            st.add_log("<- " + m.address + "  " + fmt_args(m));
-            // Server-pushed theremin updates: drive the local synth.
-            if (g_therm && !m.args.empty()) {
-                if (m.address == "/server/theremin/pitch") {
-                    if (auto p = std::get_if<float>(&m.args[0])) g_therm->set_pitch(*p);
-                } else if (m.address == "/server/theremin/volume") {
-                    if (auto p = std::get_if<float>(&m.args[0])) g_therm->set_volume(*p);
-                }
+            std::ostringstream argstr;
+            for (size_t i = 0; i < m.args.size(); ++i) {
+                if (i) argstr << ", ";
+                const auto& a = m.args[i];
+                if      (auto p = std::get_if<int32_t>(&a))     argstr << *p << "i";
+                else if (auto p = std::get_if<float>(&a))       argstr << *p << "f";
+                else if (auto p = std::get_if<std::string>(&a)) argstr << '"' << *p << '"';
+                else if (auto p = std::get_if<bool>(&a))        argstr << (*p ? "true" : "false");
+                else if (auto p = std::get_if<osc::Blob>(&a))   argstr << "<blob " << p->size() << "B>";
             }
-            // Server-pushed rename: relabel our core sliders.
+            log_line("<- " + m.address + "  " + argstr.str());
+
             if (!m.args.empty()) {
-                if (auto p = std::get_if<std::string>(&m.args[0])) {
-                    std::lock_guard<std::mutex> lk(st.mtx);
-                    if      (m.address == "/server/rename/freq") st.name_freq = *p;
-                    else if (m.address == "/server/rename/gain") st.name_gain = *p;
-                    else if (m.address == "/server/rename/lfo")  st.name_lfo  = *p;
-                }
-            }
-            // Server-pushed values for the three core sliders.
-            if (!m.args.empty()) {
+                std::lock_guard<std::mutex> lk(g_st.mtx);
                 if (auto p = std::get_if<float>(&m.args[0])) {
-                    std::lock_guard<std::mutex> lk(st.mtx);
-                    if      (m.address == "/server/freq") st.server_freq = *p;
-                    else if (m.address == "/server/gain") st.server_gain = *p;
-                    else if (m.address == "/server/lfo")  st.server_lfo  = *p;
+                    if      (m.address == "/server/freq")             g_st.pending_freq = *p;
+                    else if (m.address == "/server/gain")             g_st.pending_gain = *p;
+                    else if (m.address == "/server/lfo")              g_st.pending_lfo = *p;
+                    else if (m.address == "/server/theremin/pitch")   g_st.pending_therm_pitch = *p;
+                    else if (m.address == "/server/theremin/volume")  g_st.pending_therm_volume = *p;
+                }
+                if (std::holds_alternative<bool>(m.args[0])) {
+                    if      (m.address == "/server/transport/play") g_st.pending_play = true;
+                    else if (m.address == "/server/transport/stop") g_st.pending_play = false;
+                }
+                if (auto p = std::get_if<std::string>(&m.args[0])) {
+                    if      (m.address == "/server/rename/freq") { g_st.name_freq = *p; g_st.names_dirty = true; }
+                    else if (m.address == "/server/rename/gain") { g_st.name_gain = *p; g_st.names_dirty = true; }
+                    else if (m.address == "/server/rename/lfo")  { g_st.name_lfo  = *p; g_st.names_dirty = true; }
                 }
             }
         } catch (const std::exception& e) {
-            st.add_log(std::string("!  decode: ") + e.what());
+            log_line(std::string("!  decode error: ") + e.what());
         }
     }
 }
 
-// Stdin command loop. Commands are line-buffered: type and press Enter.
-//   t <host> <port>   change target address
-//   T                 toggle theremin on/off (sends /theremin/on)
-//   P <hz>            set theremin pitch
-//   V <0..1>          set theremin volume
-//   p                 toggle pause (stop sending demo messages)
-//   c                 clear log
-//   h                 show help
-//   q                 quit
-template <class Arg>
-static void send_to_dest(State& st, const std::string& addr, const Arg& a) {
-    if (g_send_sock == OSC_INVALID_SOCKET) return;
-    osc::MessageBuilder b(addr); b.add(a);
-    sockaddr_in d;
-    { std::lock_guard<std::mutex> lk(st.mtx); d = st.dest; }
-    osc::send_to(g_send_sock, d, b.build());
+// ---- Helpers used by callbacks --------------------------------------------
+void apply_dest(const char* host_c, const char* port_c) {
+    std::string h = host_c ? host_c : "127.0.0.1";
+    if (h.empty()) h = "127.0.0.1";
+    int p = std::atoi(port_c ? port_c : "9000");
+    if (p < 0 || p > 65535) {
+        log_line("!  invalid port");
+        return;
+    }
+    try {
+        sockaddr_in d = osc::make_dest(h, static_cast<uint16_t>(p));
+        std::lock_guard<std::mutex> lk(g_st.mtx);
+        g_st.dest      = d;
+        g_st.dest_host = h;
+        g_st.dest_port = static_cast<uint16_t>(p);
+    } catch (const std::exception& e) {
+        log_line(std::string("!  apply target failed: ") + e.what());
+        return;
+    }
+    char buf[160];
+    std::snprintf(buf, sizeof(buf),
+                  "sending to %s:%d   listening on 127.0.0.1:%u",
+                  h.c_str(), p, static_cast<unsigned>(g_st.local_port));
+    w_dest_status->copy_label(buf);
 }
 
-static void input_loop(State& st) {
-    std::string line;
-    while (g_running && std::getline(std::cin, line)) {
-        if (line.empty()) continue;
-        std::istringstream iss(line);
-        std::string cmd; iss >> cmd;
-
-        if (cmd == "q" || cmd == "Q") { g_running = false; return; }
-
-        if (cmd == "t" || cmd == "target") {
-            std::string h; int p = 0;
-            if ((iss >> h >> p) && p >= 0 && p <= 65535) {
-                try {
-                    sockaddr_in d = osc::make_dest(h, static_cast<uint16_t>(p));
-                    {
-                        std::lock_guard<std::mutex> lk(st.mtx);
-                        st.dest = d;
-                        st.dest_host = h;
-                        st.dest_port = static_cast<uint16_t>(p);
-                    }
-                    st.add_log("[client] target = " + h + ":" + std::to_string(p));
-                } catch (const std::exception& e) {
-                    st.add_log(std::string("!  target error: ") + e.what());
-                }
-            } else {
-                st.add_log("!  usage: t <host> <port>");
-            }
-            continue;
-        }
-
-        if (cmd == "p") {
-            std::lock_guard<std::mutex> lk(st.mtx);
-            st.paused = !st.paused;
-            st.log.push_back(std::string("[client] demo ") +
-                             (st.paused ? "PAUSED" : "RUNNING"));
-            while (st.log.size() > 12) st.log.pop_front();
-            continue;
-        }
-        if (cmd == "c") {
-            std::lock_guard<std::mutex> lk(st.mtx);
-            st.log.clear();
-            continue;
-        }
-        if (cmd == "h" || cmd == "?") {
-            st.add_log("[help] t <host> <port>=retarget  p=pause demo  c=clear  q=quit");
-            st.add_log("[help] T=theremin on/off  P <hz>=pitch  V <0..1>=volume");
-            continue;
-        }
-
-        if (cmd == "T") {
-            if (g_therm) {
-                bool now = !g_therm->on();
-                g_therm->set_on(now);
-                st.add_log(std::string("[client] theremin ") + (now ? "ON" : "OFF"));
-                send_to_dest(st, "/theremin/on", now);
-            }
-            continue;
-        }
-        if (cmd == "P") {
-            float hz = 0.0f;
-            if (iss >> hz && hz >= 20.0f && hz <= 20000.0f && g_therm) {
-                g_therm->set_pitch(hz);
-                st.add_log("[client] theremin pitch = " + std::to_string(hz) + " Hz");
-                send_to_dest(st, "/theremin/pitch", hz);
-            } else {
-                st.add_log("!  usage: P <hz>");
-            }
-            continue;
-        }
-        if (cmd == "V") {
-            float v = 0.0f;
-            if (iss >> v && v >= 0.0f && v <= 1.0f && g_therm) {
-                g_therm->set_volume(v);
-                st.add_log("[client] theremin volume = " + std::to_string(v));
-                send_to_dest(st, "/theremin/volume", v);
-            } else {
-                st.add_log("!  usage: V <0..1>");
-            }
-            continue;
-        }
-    }
+void update_therm_status() {
+    if (!g_therm) return;
+    char buf[160];
+    std::snprintf(buf, sizeof(buf), "%s | %.1f Hz, %.2f  | %s",
+                  g_therm->on() ? "ON " : "OFF",
+                  g_therm->pitch(), g_therm->volume(),
+                  g_therm->backend().c_str());
+    w_therm_status->copy_label(buf);
 }
 
-static void draw(const std::string& host, uint16_t port, uint16_t local_port,
-                 const std::string& name_freq, const std::string& name_gain,
-                 const std::string& name_lfo,
-                 double freq, double gain, double lfo, bool playing,
-                 bool paused, const std::vector<std::string>& lines) {
-    std::ostringstream o;
-    o << ansi::HOME;
+// ---- Callbacks ------------------------------------------------------------
+void apply_dest_cb(Fl_Widget*, void*) {
+    apply_dest(w_host_input->value(), w_port_input->value());
+}
+void freq_cb(Fl_Widget*, void*)  { send_msg<float>("/synth/freq",          static_cast<float>(w_freq_slider->value())); }
+void gain_cb(Fl_Widget*, void*)  { send_msg<float>("/mixer/channel/1/gain",static_cast<float>(w_gain_slider->value())); }
+void lfo_cb(Fl_Widget*, void*)   { send_msg<float>("/lfo/value",           static_cast<float>(w_lfo_slider->value())); }
 
-    // ---- Banner -----------------------------------------------------
-    // Bright blue background, white bold text, full-width.
-    o << "\033[44;1;97m"
-      << "                            OSC  CLIENT                            "
-      << ansi::RESET << ansi::CLR_EOL << "\n"
-      << ansi::CLR_EOL << "\n";
-
-    // ---- Address ----------------------------------------------------
-    o << "Target address:  " << ansi::CYAN << host << ":" << port << ansi::RESET
-      << "    Local recv port: " << local_port << ansi::CLR_EOL << "\n";
-    o << ansi::DIM << "(type  t <host> <port>  to retarget)"
-      << ansi::RESET << ansi::CLR_EOL << "\n";
-    o << ansi::CLR_EOL << "\n";
-
-    // ---- State (Frequency / Gain / LFO bars from the demo) ----------
-    char fbuf[64];
-    o << ansi::BOLD << "Sliders" << ansi::RESET
-      << ansi::DIM   << "  (driven by the auto-demo)" << ansi::RESET
-      << ansi::CLR_EOL << "\n";
-    auto pad = [](const std::string& name) {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%-12s", (name + ":").c_str());
-        return std::string(buf);
-    };
-    std::snprintf(fbuf, sizeof(fbuf), "%6.1f Hz", freq);
-    o << "  " << pad(name_freq) << bar((freq - 220.0) / 660.0, 30) << " " << fbuf
-      << ansi::CLR_EOL << "\n";
-    std::snprintf(fbuf, sizeof(fbuf), "%5.2f", gain);
-    o << "  " << pad(name_gain) << bar(gain, 30) << " " << fbuf
-      << ansi::CLR_EOL << "\n";
-    std::snprintf(fbuf, sizeof(fbuf), "%5.2f", lfo);
-    o << "  " << pad(name_lfo)  << bar(lfo, 30) << " " << fbuf
-      << ansi::CLR_EOL << "\n";
-    o << ansi::CLR_EOL << "\n";
-
-    // ---- Theremin ---------------------------------------------------
-    if (g_therm) {
-        o << ansi::BOLD << "Theremin" << ansi::RESET
-          << ansi::DIM   << "  (T=on/off  P <hz>  V <0..1>)" << ansi::RESET
-          << ansi::CLR_EOL << "\n";
-        o << "  On/Off:     "
-          << (g_therm->on() ? std::string(ansi::GREEN) + "ON "
-                            : std::string(ansi::DIM)   + "OFF")
-          << ansi::RESET << ansi::CLR_EOL << "\n";
-        std::snprintf(fbuf, sizeof(fbuf), "%6.1f Hz", g_therm->pitch());
-        o << "  Pitch:      "
-          << bar((g_therm->pitch() - 80.0) / (2000.0 - 80.0), 30) << " " << fbuf
-          << ansi::CLR_EOL << "\n";
-        std::snprintf(fbuf, sizeof(fbuf), "%5.2f", g_therm->volume());
-        o << "  Volume:     " << bar(g_therm->volume(), 30) << " " << fbuf
-          << ansi::CLR_EOL << "\n";
-        o << ansi::DIM << "  backend: " << g_therm->backend() << ansi::RESET
-          << ansi::CLR_EOL << "\n";
-        o << ansi::CLR_EOL << "\n";
-    }
-
-    // ---- Action / Behaviour line ------------------------------------
-    o << ansi::BOLD << "Behaviour" << ansi::RESET << ansi::CLR_EOL << "\n";
-    o << "  Demo:       " << (paused ? std::string(ansi::YELLOW) + "PAUSED"
-                                     : std::string(ansi::GREEN)  + "RUNNING")
-      << ansi::RESET
-      << "    Transport: "
-      << (playing ? std::string(ansi::GREEN) + ">> PLAYING"
-                  : std::string(ansi::DIM)   + "[] STOPPED")
-      << ansi::RESET << ansi::CLR_EOL << "\n";
-    o << ansi::CLR_EOL << "\n";
-
-    // ---- Log --------------------------------------------------------
-    o << ansi::BOLD << "Log" << ansi::RESET
-      << ansi::DIM   << "  (-> sent / <- received)" << ansi::RESET
-      << ansi::CLR_EOL << "\n";
-    for (size_t i = 0; i < 12; ++i) {
-        o << "  ";
-        if (i < lines.size()) {
-            const std::string& s = lines[i];
-            if (!s.empty() && s[0] == '-')      o << ansi::GREEN;
-            else if (!s.empty() && s[0] == '<') o << ansi::CYAN;
-            else                                 o << ansi::YELLOW;
-            o << s << ansi::RESET;
-        }
-        o << ansi::CLR_EOL << "\n";
-    }
-    o << ansi::CLR_EOL << "\n";
-
-    // ---- Command bar ------------------------------------------------
-    o << ansi::DIM
-      << "Commands: t <host> <port>=retarget  p=pause demo  c=clear  q=quit\n"
-      << "          T=theremin on/off  P <hz>=pitch  V <0..1>=volume   (then Enter)"
-      << ansi::RESET << ansi::CLR_EOL << "\n";
-
-    std::cout << o.str();
-    std::cout.flush();
+void therm_btn_cb(Fl_Widget*, void*) {
+    bool on = w_therm_btn->value() != 0;
+    if (g_therm) g_therm->set_on(on);
+    w_therm_btn->copy_label(on ? "Theremin: ON " : "Theremin: OFF");
+    update_therm_status();
+    send_msg<bool>("/theremin/on", on);
+    log_line(on ? std::string("[theremin] ON  (") + (g_therm ? g_therm->backend() : "") + ")"
+                : std::string("[theremin] OFF"));
+}
+void therm_pitch_cb(Fl_Widget*, void*) {
+    float v = static_cast<float>(w_therm_pitch->value());
+    if (g_therm) g_therm->set_pitch(v);
+    update_therm_status();
+    send_msg<float>("/theremin/pitch", v);
+}
+void therm_volume_cb(Fl_Widget*, void*) {
+    float v = static_cast<float>(w_therm_volume->value());
+    if (g_therm) g_therm->set_volume(v);
+    update_therm_status();
+    send_msg<float>("/theremin/volume", v);
 }
 
+// 1-second test tone state (restored after the timeout).
+struct TestSoundState { float pitch; float vol; bool on; };
+TestSoundState g_test_prev{};
+void test_sound_restore_cb(void*) {
+    if (!g_therm) return;
+    g_therm->set_pitch(g_test_prev.pitch);
+    g_therm->set_volume(g_test_prev.vol);
+    g_therm->set_on(g_test_prev.on);
+    update_therm_status();
+}
+void test_sound_cb(Fl_Widget*, void*) {
+    if (!g_therm || !g_therm->available()) {
+        log_line("!  no audio backend; install sounddevice / libasound2-dev");
+        return;
+    }
+    g_test_prev.pitch = g_therm->pitch();
+    g_test_prev.vol   = g_therm->volume();
+    g_test_prev.on    = g_therm->on();
+    g_therm->set_pitch(440.0f);
+    g_therm->set_volume(0.7f);
+    g_therm->set_on(true);
+    update_therm_status();
+    log_line("[theremin] Test Sound: 440 Hz for 1 second");
+    Fl::add_timeout(1.0, test_sound_restore_cb);
+}
+
+void play_cb(Fl_Widget*, void*)  { send_msg<bool>("/transport/play", true); }
+void stop_cb(Fl_Widget*, void*)  { send_msg<bool>("/transport/stop", true); }
+void hello_cb(Fl_Widget*, void*) { send_msg<std::string>("/hello", "world"); }
+void note_trigger_cb(Fl_Widget*, void*) {
+    int note = std::atoi(w_note_input->value());
+    int vel  = std::atoi(w_vel_input->value());
+    send_two_ints("/synth/note", note, vel);
+}
+void clear_log_cb(Fl_Widget*, void*) { w_log_buffer->text(""); }
+
+// Periodic main-thread tick: drain queues and apply server-pushed
+// updates to the widgets.
+void tick_cb(void*) {
+    std::vector<std::string> lines;
+    std::optional<float> freq, gain, lfo, tp, tv;
+    std::optional<bool> play;
+    bool names_dirty = false;
+    std::string nf, ng, nl;
+
+    {
+        std::lock_guard<std::mutex> lk(g_st.mtx);
+        if (!g_st.pending_log.empty()) {
+            lines.assign(g_st.pending_log.begin(), g_st.pending_log.end());
+            g_st.pending_log.clear();
+        }
+        freq = g_st.pending_freq;          g_st.pending_freq.reset();
+        gain = g_st.pending_gain;          g_st.pending_gain.reset();
+        lfo  = g_st.pending_lfo;           g_st.pending_lfo.reset();
+        tp   = g_st.pending_therm_pitch;   g_st.pending_therm_pitch.reset();
+        tv   = g_st.pending_therm_volume;  g_st.pending_therm_volume.reset();
+        play = g_st.pending_play;          g_st.pending_play.reset();
+        names_dirty = g_st.names_dirty;    g_st.names_dirty = false;
+        nf = g_st.name_freq; ng = g_st.name_gain; nl = g_st.name_lfo;
+    }
+
+    for (const auto& l : lines) {
+        w_log_buffer->append(l.c_str());
+        w_log_buffer->append("\n");
+    }
+    if (!lines.empty()) w_log_display->scroll(w_log_buffer->length(), 0);
+
+    // Setting the slider value programmatically and then firing the
+    // callback so the new value gets sent on as /synth/* (mirrors the
+    // tkinter Scale behavior on the Python side).
+    if (freq) { w_freq_slider->value(*freq); freq_cb(w_freq_slider, nullptr); }
+    if (gain) { w_gain_slider->value(*gain); gain_cb(w_gain_slider, nullptr); }
+    if (lfo)  { w_lfo_slider->value(*lfo);   lfo_cb(w_lfo_slider, nullptr); }
+    if (tp)   { w_therm_pitch->value(*tp);   therm_pitch_cb(w_therm_pitch, nullptr); }
+    if (tv)   { w_therm_volume->value(*tv);  therm_volume_cb(w_therm_volume, nullptr); }
+    if (play) {
+        // Just log; the client doesn't have a transport to drive locally.
+        log_line(*play ? "[client] server told us: play"
+                       : "[client] server told us: stop");
+    }
+    if (names_dirty) {
+        w_name_freq_lbl->copy_label(nf.c_str());
+        w_name_gain_lbl->copy_label(ng.c_str());
+        w_name_lfo_lbl ->copy_label(nl.c_str());
+        w_name_freq_lbl->redraw();
+        w_name_gain_lbl->redraw();
+        w_name_lfo_lbl ->redraw();
+    }
+
+    Fl::repeat_timeout(0.05, tick_cb);
+}
+
+} // namespace
+
+// ---- main -----------------------------------------------------------------
 int main(int argc, char** argv) {
     std::string host = (argc > 1) ? argv[1] : "127.0.0.1";
     uint16_t    port = (argc > 2) ? static_cast<uint16_t>(std::atoi(argv[2])) : 9000;
 
-    std::signal(SIGINT, on_sigint);
-#ifndef _WIN32
-    std::signal(SIGTERM, on_sigint);
-#endif
+    Fl::lock();
+    Fl::scheme("gtk+");
+    Fl::background(245, 245, 245);
 
-    try {
-        osc::enable_ansi();
+    // Create theremin synth (audio thread starts immediately; output is
+    // gated by on/off).
+    osc::Theremin therm;
+    g_therm = &therm;
 
-        socket_t sock = osc::make_udp_socket();
-        osc::bind_udp(sock, "0.0.0.0", 0);          // ephemeral local port
-        osc::set_recv_timeout_ms(sock, 200);
-        uint16_t local_port = osc::local_port_of(sock);
-
-        State st;
-        st.dest      = osc::make_dest(host, port);
-        st.dest_host = host;
-        st.dest_port = port;
-
-        osc::Theremin therm;
-        g_therm     = &therm;
-        g_send_sock = sock;
-
-        std::thread rcv(recv_loop, sock, std::ref(st));
-        std::thread inp(input_loop, std::ref(st));
-
-        std::cout << ansi::CLEAR << ansi::HIDE; std::cout.flush();
-
-        double t = 0.0;
-        bool playing = false;
-        int  hello_n = 0;
-        int  tick = 0;
-
-        while (g_running) {
-            bool paused;
-            sockaddr_in dest;
-            std::string cur_host, cur_name_freq, cur_name_gain, cur_name_lfo;
-            uint16_t cur_port;
-            std::optional<float> sf, sg, sl;
-            {
-                std::lock_guard<std::mutex> lk(st.mtx);
-                paused        = st.paused;
-                dest          = st.dest;
-                cur_host      = st.dest_host;
-                cur_port      = st.dest_port;
-                cur_name_freq = st.name_freq;
-                cur_name_gain = st.name_gain;
-                cur_name_lfo  = st.name_lfo;
-                sf = st.server_freq;
-                sg = st.server_gain;
-                sl = st.server_lfo;
-            }
-
-            // Animated values; once the server has pushed a value, that
-            // sticks and the demo follows the server's set point.
-            double freq = sf ? static_cast<double>(*sf)
-                             : 220.0 + 330.0 * (1.0 + std::sin(t * 0.6));   // 220..880
-            double gain = sg ? static_cast<double>(*sg)
-                             : 0.5  + 0.45 * std::sin(t * 0.9);             // 0.05..0.95
-            double lfo  = sl ? static_cast<double>(*sl)
-                             : std::fmod(t * 0.25, 1.0);                    // 0..1 sawtooth
-
-            if (!paused) {
-                if (tick % 4 == 0) {
-                    osc::MessageBuilder b("/synth/freq"); b.add(static_cast<float>(freq));
-                    osc::send_to(sock, dest, b.build());
-                    st.add_log("-> /synth/freq " + std::to_string(static_cast<int>(freq)) + ".0");
-                }
-                if (tick % 4 == 2) {
-                    osc::MessageBuilder b("/mixer/channel/1/gain"); b.add(static_cast<float>(gain));
-                    osc::send_to(sock, dest, b.build());
-                    char buf[32]; std::snprintf(buf, sizeof(buf), "%.2f", gain);
-                    st.add_log(std::string("-> /mixer/channel/1/gain ") + buf);
-                }
-                if (tick % 8 == 4) {
-                    osc::MessageBuilder b("/lfo/value"); b.add(static_cast<float>(lfo));
-                    osc::send_to(sock, dest, b.build());
-                    char buf[32]; std::snprintf(buf, sizeof(buf), "%.2f", lfo);
-                    st.add_log(std::string("-> /lfo/value ") + buf);
-                }
-                if (tick % 80 == 0) {
-                    playing = !playing;
-                    osc::MessageBuilder b(playing ? "/transport/play" : "/transport/stop");
-                    b.add(true);
-                    osc::send_to(sock, dest, b.build());
-                    st.add_log(playing ? "-> /transport/play T" : "-> /transport/stop T");
-                }
-                if (tick % 60 == 30) {
-                    std::string greet = "world " + std::to_string(hello_n++);
-                    osc::MessageBuilder b("/hello"); b.add(greet);
-                    osc::send_to(sock, dest, b.build());
-                    st.add_log("-> /hello \"" + greet + "\"");
-                }
-            }
-
-            draw(cur_host, cur_port, local_port,
-                 cur_name_freq, cur_name_gain, cur_name_lfo,
-                 freq, gain, lfo, playing, paused, st.log_snapshot());
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            t += 0.05;
-            ++tick;
-        }
-
-        // Clean up: unblock the recv thread, then exit.
-        std::cout << ansi::SHOW << ansi::RESET << "\n";
-        std::cout.flush();
-        therm.stop();
-        g_therm = nullptr;
-        osc_close_socket(sock);
-        if (rcv.joinable()) rcv.join();
-        // input thread is blocked on getline; the process will reap it on exit.
-        inp.detach();
-        osc::platform_shutdown();
-    } catch (const std::exception& e) {
-        std::cout << ansi::SHOW << ansi::RESET;
-        std::cerr << "fatal: " << e.what() << "\n";
-        return 1;
+    // Open the UDP socket once; ephemeral local port so the server's
+    // /ack replies route back.
+    socket_t sock = osc::make_udp_socket();
+    osc::bind_udp(sock, "0.0.0.0", 0);
+    osc::set_recv_timeout_ms(sock, 200);
+    {
+        std::lock_guard<std::mutex> lk(g_st.mtx);
+        g_st.sock       = sock;
+        g_st.dest       = osc::make_dest(host, port);
+        g_st.dest_host  = host;
+        g_st.dest_port  = port;
+        g_st.local_port = osc::local_port_of(sock);
     }
-    return 0;
+
+    const int W = 600, H = 760;
+    w_window = new Fl_Window(W, H, "OSC Client");
+
+    int y = 0;
+
+    // ---- Banner ----
+    auto* banner = new Fl_Box(0, y, W, 44, "OSC  CLIENT");
+    banner->box(FL_FLAT_BOX);
+    banner->color(fl_rgb_color(21, 101, 192));   // #1565C0
+    banner->labelcolor(FL_WHITE);
+    banner->labelsize(18);
+    banner->labelfont(FL_HELVETICA_BOLD);
+    y += 54;
+
+    // ---- Target address ----
+    auto* addr_grp = new Fl_Group(10, y, W-20, 70, "Target address");
+    addr_grp->box(FL_BORDER_FRAME);
+    addr_grp->align(FL_ALIGN_TOP_LEFT);
+    {
+        new Fl_Box(20, y+18, 36, 24, "Host:");
+        w_host_input = new Fl_Input(60, y+18, 140, 24);
+        w_host_input->value(host.c_str());
+        new Fl_Box(210, y+18, 36, 24, "Port:");
+        w_port_input = new Fl_Input(250, y+18, 64, 24);
+        w_port_input->value(std::to_string(port).c_str());
+        auto* apply = new Fl_Button(324, y+18, 70, 24, "Apply");
+        apply->callback(apply_dest_cb);
+    }
+    addr_grp->end();
+    y += 80;
+
+    char dest_buf[160];
+    std::snprintf(dest_buf, sizeof(dest_buf),
+                  "sending to %s:%u   listening on 127.0.0.1:%u",
+                  host.c_str(), port,
+                  static_cast<unsigned>(g_st.local_port));
+    w_dest_status = new Fl_Box(20, y, W-40, 22, "");
+    w_dest_status->copy_label(dest_buf);
+    w_dest_status->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+    w_dest_status->labelfont(FL_HELVETICA_BOLD);
+    y += 28;
+
+    // ---- Sliders (Frequency / Gain / LFO) ----
+    auto* sliders_grp = new Fl_Group(10, y, W-20, 130,
+                                     "Sliders (send on change)");
+    sliders_grp->box(FL_BORDER_FRAME);
+    sliders_grp->align(FL_ALIGN_TOP_LEFT);
+    {
+        const int LX = 20, LW = 110, SX = 140, SW = W - 160;
+        w_name_freq_lbl = new Fl_Box(LX, y+12, LW, 24, "Frequency");
+        w_name_freq_lbl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+        w_freq_slider = new Fl_Value_Slider(SX, y+12, SW, 24);
+        w_freq_slider->type(FL_HOR_NICE_SLIDER);
+        w_freq_slider->bounds(20, 2000);
+        w_freq_slider->value(440.0);
+        w_freq_slider->callback(freq_cb);
+
+        w_name_gain_lbl = new Fl_Box(LX, y+44, LW, 24, "Gain");
+        w_name_gain_lbl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+        w_gain_slider = new Fl_Value_Slider(SX, y+44, SW, 24);
+        w_gain_slider->type(FL_HOR_NICE_SLIDER);
+        w_gain_slider->bounds(0, 1);
+        w_gain_slider->value(0.75);
+        w_gain_slider->callback(gain_cb);
+
+        w_name_lfo_lbl = new Fl_Box(LX, y+76, LW, 24, "LFO");
+        w_name_lfo_lbl->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+        w_lfo_slider = new Fl_Value_Slider(SX, y+76, SW, 24);
+        w_lfo_slider->type(FL_HOR_NICE_SLIDER);
+        w_lfo_slider->bounds(0, 1);
+        w_lfo_slider->value(0.5);
+        w_lfo_slider->callback(lfo_cb);
+    }
+    sliders_grp->end();
+    y += 140;
+
+    // ---- Theremin (real audio synth on this machine) ----
+    auto* therm_grp = new Fl_Group(10, y, W-20, 160,
+                                   "Theremin (digital synth on this client)");
+    therm_grp->box(FL_BORDER_FRAME);
+    therm_grp->align(FL_ALIGN_TOP_LEFT);
+    {
+        // NO SOUND warning row, only visible if audio is unavailable.
+        if (!g_therm->available()) {
+            w_audio_warning = new Fl_Box(20, y+12, W-40, 22,
+                                         "NO SOUND - audio backend not available");
+            w_audio_warning->box(FL_FLAT_BOX);
+            w_audio_warning->color(fl_rgb_color(255, 235, 238)); // #FFEBEE
+            w_audio_warning->labelcolor(fl_rgb_color(183, 28, 28));
+            w_audio_warning->labelfont(FL_HELVETICA_BOLD);
+            w_audio_warning->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+        }
+        int row_y = g_therm->available() ? y+12 : y+38;
+
+        w_therm_btn = new Fl_Toggle_Button(20, row_y, 130, 28, "Theremin: OFF");
+        w_therm_btn->callback(therm_btn_cb);
+        auto* test = new Fl_Button(160, row_y, 120, 28, "Test Sound (1s)");
+        test->callback(test_sound_cb);
+        if (!g_therm->available()) test->deactivate();
+        char st_buf[160];
+        std::snprintf(st_buf, sizeof(st_buf), "OFF | 440.0 Hz, 0.70 | %s",
+                      g_therm->backend().c_str());
+        w_therm_status = new Fl_Box(290, row_y, W-310, 28, "");
+        w_therm_status->copy_label(st_buf);
+        w_therm_status->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+
+        const int LX = 20, LW = 110, SX = 140, SW = W - 160;
+        new Fl_Box(LX, row_y+38, LW, 24, "Pitch (Hz)");
+        w_therm_pitch = new Fl_Value_Slider(SX, row_y+38, SW, 24);
+        w_therm_pitch->type(FL_HOR_NICE_SLIDER);
+        w_therm_pitch->bounds(80, 2000);
+        w_therm_pitch->value(440.0);
+        w_therm_pitch->callback(therm_pitch_cb);
+
+        new Fl_Box(LX, row_y+70, LW, 24, "Volume");
+        w_therm_volume = new Fl_Value_Slider(SX, row_y+70, SW, 24);
+        w_therm_volume->type(FL_HOR_NICE_SLIDER);
+        w_therm_volume->bounds(0, 1);
+        w_therm_volume->value(0.7);
+        w_therm_volume->callback(therm_volume_cb);
+    }
+    therm_grp->end();
+    y += 170;
+
+    // ---- Buttons ----
+    auto* btn_grp = new Fl_Group(10, y, W-20, 50, "Buttons");
+    btn_grp->box(FL_BORDER_FRAME);
+    btn_grp->align(FL_ALIGN_TOP_LEFT);
+    {
+        int bx = 20;
+        auto* p = new Fl_Button(bx, y+10, 70, 28, "Play");          bx += 80;
+        p->callback(play_cb);
+        auto* s = new Fl_Button(bx, y+10, 70, 28, "Stop");          bx += 80;
+        s->callback(stop_cb);
+        auto* h = new Fl_Button(bx, y+10, 130, 28, "/hello \"world\"");
+        h->callback(hello_cb);
+    }
+    btn_grp->end();
+    y += 60;
+
+    // ---- Note trigger ----
+    auto* note_grp = new Fl_Group(10, y, W-20, 50, "Note trigger");
+    note_grp->box(FL_BORDER_FRAME);
+    note_grp->align(FL_ALIGN_TOP_LEFT);
+    {
+        new Fl_Box(20, y+12, 50, 24, "Note:");
+        w_note_input = new Fl_Int_Input(70, y+12, 60, 24);
+        w_note_input->value("60");
+        new Fl_Box(140, y+12, 60, 24, "Velocity:");
+        w_vel_input = new Fl_Int_Input(200, y+12, 60, 24);
+        w_vel_input->value("100");
+        auto* trig = new Fl_Button(280, y+12, 90, 24, "Trigger");
+        trig->callback(note_trigger_cb);
+    }
+    note_grp->end();
+    y += 60;
+
+    // ---- Behaviour ----
+    auto* beh_grp = new Fl_Group(10, y, W-20, 50, "Behaviour");
+    beh_grp->box(FL_BORDER_FRAME);
+    beh_grp->align(FL_ALIGN_TOP_LEFT);
+    {
+        auto* clr = new Fl_Button(W-110, y+10, 80, 28, "Clear log");
+        clr->callback(clear_log_cb);
+    }
+    beh_grp->end();
+    y += 60;
+
+    // ---- Log ----
+    auto* log_grp = new Fl_Group(10, y, W-20, H-y-10,
+                                 "Log  (-> sent  /  <- received)");
+    log_grp->box(FL_BORDER_FRAME);
+    log_grp->align(FL_ALIGN_TOP_LEFT);
+    {
+        w_log_buffer = new Fl_Text_Buffer();
+        w_log_display = new Fl_Text_Display(20, y+12, W-40, H-y-30);
+        w_log_display->buffer(w_log_buffer);
+        w_log_display->textfont(FL_COURIER);
+        w_log_display->textsize(12);
+    }
+    log_grp->end();
+
+    w_window->end();
+    w_window->resizable(log_grp);
+    w_window->show(argc, argv);
+
+    std::thread rcv(recv_loop);
+    Fl::add_timeout(0.05, tick_cb);
+
+    int rc = Fl::run();
+
+    g_running = false;
+    {
+        std::lock_guard<std::mutex> lk(g_st.mtx);
+        if (g_st.sock != OSC_INVALID_SOCKET) {
+            osc_close_socket(g_st.sock);
+            g_st.sock = OSC_INVALID_SOCKET;
+        }
+    }
+    if (rcv.joinable()) rcv.join();
+    therm.stop();
+    osc::platform_shutdown();
+    return rc;
 }
