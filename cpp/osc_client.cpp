@@ -19,7 +19,6 @@
 #include <FL/Fl_Button.H>
 #include <FL/Fl_Toggle_Button.H>
 #include <FL/Fl_Input.H>
-#include <FL/Fl_Int_Input.H>
 #include <FL/Fl_Value_Slider.H>
 #include <FL/Fl_Text_Buffer.H>
 #include <FL/Fl_Text_Display.H>
@@ -91,8 +90,6 @@ Fl_Box*          w_therm_status   = nullptr;
 Fl_Value_Slider* w_therm_pitch    = nullptr;
 Fl_Value_Slider* w_therm_volume   = nullptr;
 Fl_Box*          w_audio_warning  = nullptr;
-Fl_Int_Input*    w_note_input     = nullptr;
-Fl_Int_Input*    w_vel_input      = nullptr;
 Fl_Text_Buffer*  w_log_buffer     = nullptr;
 Fl_Text_Display* w_log_display    = nullptr;
 
@@ -140,21 +137,6 @@ void send_msg(const std::string& addr, const Arg& arg) {
     if constexpr (std::is_same_v<Arg, std::string>) s << "\"" << arg << "\"";
     else if constexpr (std::is_same_v<Arg, bool>)   s << (arg ? "true" : "false");
     else                                            s << arg;
-    log_line(s.str());
-}
-
-void send_two_ints(const std::string& addr, int32_t a, int32_t b) {
-    socket_t sock; sockaddr_in dest;
-    {
-        std::lock_guard<std::mutex> lk(g_st.mtx);
-        sock = g_st.sock;
-        dest = g_st.dest;
-    }
-    if (sock == OSC_INVALID_SOCKET) return;
-    osc::MessageBuilder mb(addr); mb.add(a); mb.add(b);
-    osc::send_to(sock, dest, mb.build());
-    std::ostringstream s;
-    s << "-> " << addr << "  " << a << ", " << b;
     log_line(s.str());
 }
 
@@ -309,11 +291,6 @@ void test_sound_cb(Fl_Widget*, void*) {
 void play_cb(Fl_Widget*, void*)  { send_msg<bool>("/transport/play", true); }
 void stop_cb(Fl_Widget*, void*)  { send_msg<bool>("/transport/stop", true); }
 void hello_cb(Fl_Widget*, void*) { send_msg<std::string>("/hello", "world"); }
-void note_trigger_cb(Fl_Widget*, void*) {
-    int note = std::atoi(w_note_input->value());
-    int vel  = std::atoi(w_vel_input->value());
-    send_two_ints("/synth/note", note, vel);
-}
 void clear_log_cb(Fl_Widget*, void*) { w_log_buffer->text(""); }
 
 // Periodic main-thread tick: drain queues and apply server-pushed
@@ -441,7 +418,7 @@ int main(int argc, char** argv) {
     w_dest_status->copy_label(dest_buf);
     w_dest_status->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
     w_dest_status->labelfont(FL_HELVETICA_BOLD);
-    y += 28;
+    y += 40;   // leave breathing room before the next section
 
     // ---- Sliders (Frequency / Gain / LFO) ----
     auto* sliders_grp = new Fl_Group(10, y, W-20, 130,
@@ -539,23 +516,6 @@ int main(int argc, char** argv) {
         h->callback(hello_cb);
     }
     btn_grp->end();
-    y += 60;
-
-    // ---- Note trigger ----
-    auto* note_grp = new Fl_Group(10, y, W-20, 50, "Note trigger");
-    note_grp->box(FL_ENGRAVED_FRAME);
-    note_grp->align(FL_ALIGN_TOP_LEFT);
-    {
-        new Fl_Box(20, y+12, 50, 24, "Note:");
-        w_note_input = new Fl_Int_Input(70, y+12, 60, 24);
-        w_note_input->value("60");
-        new Fl_Box(140, y+12, 60, 24, "Velocity:");
-        w_vel_input = new Fl_Int_Input(200, y+12, 60, 24);
-        w_vel_input->value("100");
-        auto* trig = new Fl_Button(280, y+12, 90, 24, "Trigger");
-        trig->callback(note_trigger_cb);
-    }
-    note_grp->end();
     y += 60;
 
     // ---- Behaviour ----

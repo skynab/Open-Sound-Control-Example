@@ -457,7 +457,7 @@ int main(int argc, char** argv) {
     new Fl_Box(330, y, 80, 22, "Received:");
     w_total_received = new Fl_Box(410, y, 100, 22, "0");
     w_total_received->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
-    y += 30;
+    y += 42;   // leave breathing room before the next section
 
     // ---- Sliders frame (Frequency / Gain / LFO with editable names) ----
     auto* sliders_grp = new Fl_Group(10, y, W-20, 130,
