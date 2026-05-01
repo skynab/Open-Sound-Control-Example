@@ -96,6 +96,26 @@ Fl_Int_Input*    w_vel_input      = nullptr;
 Fl_Text_Buffer*  w_log_buffer     = nullptr;
 Fl_Text_Display* w_log_display    = nullptr;
 
+// ---- Dark theme -----------------------------------------------------------
+// Same palette as the server. Repaints FLTK's defaults so widgets pick
+// it up automatically; widgets with hardcoded colours (banner, warning
+// panel) are set explicitly later.
+void apply_dark_theme() {
+    Fl::scheme("gtk+");
+    Fl::background (40,  40,  40);            // #282828 window / frame bg
+    Fl::background2(30,  30,  30);            // #1E1E1E input / log bg
+    Fl::foreground (220, 220, 220);           // #DCDCDC text
+
+    Fl::set_color(FL_LIGHT3,  72,  72,  72);
+    Fl::set_color(FL_LIGHT2,  60,  60,  60);
+    Fl::set_color(FL_LIGHT1,  50,  50,  50);
+    Fl::set_color(FL_DARK1,   28,  28,  28);
+    Fl::set_color(FL_DARK2,   18,  18,  18);
+    Fl::set_color(FL_DARK3,   10,  10,  10);
+    Fl::set_color(FL_INACTIVE_COLOR, 130, 130, 130);
+    Fl::set_color(FL_SELECTION_COLOR, 38, 79, 120);   // #264F78
+}
+
 // ---- Helpers --------------------------------------------------------------
 void log_line(const std::string& s) {
     std::lock_guard<std::mutex> lk(g_st.mtx);
@@ -360,8 +380,7 @@ int main(int argc, char** argv) {
     uint16_t    port = (argc > 2) ? static_cast<uint16_t>(std::atoi(argv[2])) : 9000;
 
     Fl::lock();
-    Fl::scheme("gtk+");
-    Fl::background(245, 245, 245);
+    apply_dark_theme();
 
     // Create theremin synth (audio thread starts immediately; output is
     // gated by on/off).
@@ -398,7 +417,7 @@ int main(int argc, char** argv) {
 
     // ---- Target address ----
     auto* addr_grp = new Fl_Group(10, y, W-20, 70, "Target address");
-    addr_grp->box(FL_BORDER_FRAME);
+    addr_grp->box(FL_ENGRAVED_FRAME);
     addr_grp->align(FL_ALIGN_TOP_LEFT);
     {
         new Fl_Box(20, y+18, 36, 24, "Host:");
@@ -427,7 +446,7 @@ int main(int argc, char** argv) {
     // ---- Sliders (Frequency / Gain / LFO) ----
     auto* sliders_grp = new Fl_Group(10, y, W-20, 130,
                                      "Sliders (send on change)");
-    sliders_grp->box(FL_BORDER_FRAME);
+    sliders_grp->box(FL_ENGRAVED_FRAME);
     sliders_grp->align(FL_ALIGN_TOP_LEFT);
     {
         const int LX = 20, LW = 110, SX = 140, SW = W - 160;
@@ -461,7 +480,7 @@ int main(int argc, char** argv) {
     // ---- Theremin (real audio synth on this machine) ----
     auto* therm_grp = new Fl_Group(10, y, W-20, 160,
                                    "Theremin (digital synth on this client)");
-    therm_grp->box(FL_BORDER_FRAME);
+    therm_grp->box(FL_ENGRAVED_FRAME);
     therm_grp->align(FL_ALIGN_TOP_LEFT);
     {
         // NO SOUND warning row, only visible if audio is unavailable.
@@ -469,8 +488,8 @@ int main(int argc, char** argv) {
             w_audio_warning = new Fl_Box(20, y+12, W-40, 22,
                                          "NO SOUND - audio backend not available");
             w_audio_warning->box(FL_FLAT_BOX);
-            w_audio_warning->color(fl_rgb_color(255, 235, 238)); // #FFEBEE
-            w_audio_warning->labelcolor(fl_rgb_color(183, 28, 28));
+            w_audio_warning->color(fl_rgb_color(80, 30, 30));      // dark red
+            w_audio_warning->labelcolor(fl_rgb_color(255, 205, 210));// light pink
             w_audio_warning->labelfont(FL_HELVETICA_BOLD);
             w_audio_warning->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
         }
@@ -508,7 +527,7 @@ int main(int argc, char** argv) {
 
     // ---- Buttons ----
     auto* btn_grp = new Fl_Group(10, y, W-20, 50, "Buttons");
-    btn_grp->box(FL_BORDER_FRAME);
+    btn_grp->box(FL_ENGRAVED_FRAME);
     btn_grp->align(FL_ALIGN_TOP_LEFT);
     {
         int bx = 20;
@@ -524,7 +543,7 @@ int main(int argc, char** argv) {
 
     // ---- Note trigger ----
     auto* note_grp = new Fl_Group(10, y, W-20, 50, "Note trigger");
-    note_grp->box(FL_BORDER_FRAME);
+    note_grp->box(FL_ENGRAVED_FRAME);
     note_grp->align(FL_ALIGN_TOP_LEFT);
     {
         new Fl_Box(20, y+12, 50, 24, "Note:");
@@ -541,7 +560,7 @@ int main(int argc, char** argv) {
 
     // ---- Behaviour ----
     auto* beh_grp = new Fl_Group(10, y, W-20, 50, "Behaviour");
-    beh_grp->box(FL_BORDER_FRAME);
+    beh_grp->box(FL_ENGRAVED_FRAME);
     beh_grp->align(FL_ALIGN_TOP_LEFT);
     {
         auto* clr = new Fl_Button(W-110, y+10, 80, 28, "Clear log");
@@ -553,7 +572,7 @@ int main(int argc, char** argv) {
     // ---- Log ----
     auto* log_grp = new Fl_Group(10, y, W-20, H-y-10,
                                  "Log  (-> sent  /  <- received)");
-    log_grp->box(FL_BORDER_FRAME);
+    log_grp->box(FL_ENGRAVED_FRAME);
     log_grp->align(FL_ALIGN_TOP_LEFT);
     {
         w_log_buffer = new Fl_Text_Buffer();

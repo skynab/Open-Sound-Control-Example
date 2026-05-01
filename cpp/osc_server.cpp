@@ -92,6 +92,28 @@ Fl_Check_Button* w_paused_check     = nullptr;
 Fl_Text_Buffer*  w_log_buffer       = nullptr;
 Fl_Text_Display* w_log_display      = nullptr;
 
+// ---- Dark theme -----------------------------------------------------------
+// Repaints FLTK's default palette to a dark scheme. Widgets that use the
+// default colours pick this up automatically; the few widgets with
+// hardcoded colours (badges, banner) are set explicitly later.
+void apply_dark_theme() {
+    Fl::scheme("gtk+");
+    Fl::background (40,  40,  40);            // #282828 window / frame bg
+    Fl::background2(30,  30,  30);            // #1E1E1E input / log bg
+    Fl::foreground (220, 220, 220);           // #DCDCDC text
+
+    // Auto-computed shading is poor on a dark base, so set the LIGHT/DARK
+    // ladder explicitly. Buttons, sliders, and frames use these.
+    Fl::set_color(FL_LIGHT3,  72,  72,  72);
+    Fl::set_color(FL_LIGHT2,  60,  60,  60);
+    Fl::set_color(FL_LIGHT1,  50,  50,  50);
+    Fl::set_color(FL_DARK1,   28,  28,  28);
+    Fl::set_color(FL_DARK2,   18,  18,  18);
+    Fl::set_color(FL_DARK3,   10,  10,  10);
+    Fl::set_color(FL_INACTIVE_COLOR, 130, 130, 130);
+    Fl::set_color(FL_SELECTION_COLOR, 38, 79, 120);   // #264F78
+}
+
 // ---- Helpers --------------------------------------------------------------
 void log_line(const std::string& s) {
     std::lock_guard<std::mutex> lk(g_st.mtx);
@@ -375,8 +397,8 @@ void tick_cb(void*) {
             w_therm_badge->color(fl_rgb_color(198, 40, 40));   // red
             w_therm_badge->labelcolor(FL_WHITE);
         } else {
-            w_therm_badge->color(fl_rgb_color(224, 224, 224)); // neutral
-            w_therm_badge->labelcolor(FL_BLACK);
+            w_therm_badge->color(fl_rgb_color(70, 70, 70));    // dark-neutral
+            w_therm_badge->labelcolor(FL_WHITE);
         }
         w_therm_badge->redraw();
     }
@@ -393,8 +415,7 @@ int main(int argc, char** argv) {
     g_st.bind_port = port;
 
     Fl::lock();   // enable thread-safe widget access (we drain via timer)
-    Fl::scheme("gtk+");
-    Fl::background(245, 245, 245);
+    apply_dark_theme();
 
     const int W = 640, H = 760;
     w_window = new Fl_Window(W, H, "OSC Server");
@@ -412,7 +433,7 @@ int main(int argc, char** argv) {
 
     // ---- Bind address ----
     auto* bind_grp = new Fl_Group(10, y, W-20, 70, "Bind address");
-    bind_grp->box(FL_BORDER_FRAME);
+    bind_grp->box(FL_ENGRAVED_FRAME);
     bind_grp->align(FL_ALIGN_TOP_LEFT);
     {
         new Fl_Box(20, y+18, 36, 24, "Host:");
@@ -441,7 +462,7 @@ int main(int argc, char** argv) {
     // ---- Sliders frame (Frequency / Gain / LFO with editable names) ----
     auto* sliders_grp = new Fl_Group(10, y, W-20, 130,
                                      "Sliders (push to last-seen sender)");
-    sliders_grp->box(FL_BORDER_FRAME);
+    sliders_grp->box(FL_ENGRAVED_FRAME);
     sliders_grp->align(FL_ALIGN_TOP_LEFT);
     {
         const int LX = 20, LW = 110, SX = 140, SW = W - 160;
@@ -482,15 +503,15 @@ int main(int argc, char** argv) {
     // ---- Theremin frame ----
     auto* therm_grp = new Fl_Group(10, y, W-20, 120,
                                    "Theremin (push to last-seen sender)");
-    therm_grp->box(FL_BORDER_FRAME);
+    therm_grp->box(FL_ENGRAVED_FRAME);
     therm_grp->align(FL_ALIGN_TOP_LEFT);
     {
         // On/Off badge (read-only mirror of the client's switch).
         new Fl_Box(20, y+12, 130, 24, "On/Off (client-side):");
         w_therm_badge = new Fl_Box(150, y+12, 50, 24, "-");
         w_therm_badge->box(FL_FLAT_BOX);
-        w_therm_badge->color(fl_rgb_color(224, 224, 224));
-        w_therm_badge->labelcolor(FL_BLACK);
+        w_therm_badge->color(fl_rgb_color(70, 70, 70));   // dark-neutral
+        w_therm_badge->labelcolor(FL_WHITE);
         w_therm_badge->labelfont(FL_HELVETICA_BOLD);
         // Pitch / Volume push sliders
         const int LX = 20, LW = 110, SX = 140, SW = W - 160;
@@ -512,7 +533,7 @@ int main(int argc, char** argv) {
 
     // ---- Buttons ----
     auto* btn_grp = new Fl_Group(10, y, W-20, 50, "Buttons");
-    btn_grp->box(FL_BORDER_FRAME);
+    btn_grp->box(FL_ENGRAVED_FRAME);
     btn_grp->align(FL_ALIGN_TOP_LEFT);
     {
         int bx = 20;
@@ -530,7 +551,7 @@ int main(int argc, char** argv) {
 
     // ---- Behaviour ----
     auto* beh_grp = new Fl_Group(10, y, W-20, 50, "Behaviour");
-    beh_grp->box(FL_BORDER_FRAME);
+    beh_grp->box(FL_ENGRAVED_FRAME);
     beh_grp->align(FL_ALIGN_TOP_LEFT);
     {
         w_echo_check = new Fl_Check_Button(20, y+12, 220, 24,
@@ -549,7 +570,7 @@ int main(int argc, char** argv) {
     // ---- Log ----
     auto* log_grp = new Fl_Group(10, y, W-20, H-y-10,
                                  "Log  (-> sent  /  <- received)");
-    log_grp->box(FL_BORDER_FRAME);
+    log_grp->box(FL_ENGRAVED_FRAME);
     log_grp->align(FL_ALIGN_TOP_LEFT);
     {
         w_log_buffer = new Fl_Text_Buffer();

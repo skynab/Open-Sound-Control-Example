@@ -7,21 +7,15 @@
 //   * Windows: WinMM  (link with -lwinmm)        -DOSC_AUDIO_WINMM
 //   * Fallback: silent (no audio output)         -DOSC_AUDIO_NONE
 //
-// If you don't define one explicitly, the header auto-picks based on the
-// platform and (on Linux) whether <alsa/asoundlib.h> is available. See
-// the Makefile for the link flags.
-//
-// Usage:
-//   osc::Theremin therm;            // starts the audio thread
-//   therm.set_pitch(440.0f);
-//   therm.set_volume(0.5f);
-//   therm.set_on(true);
-//   ...
-//   therm.stop();                   // optional; destructor also stops it
+// The constructor opens the audio device synchronously and only spawns
+// a worker thread for streaming if the open succeeded. That means
+// `available()` and `backend()` are correct the moment the constructor
+// returns -- the UI never has to race with audio initialization.
 
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -63,9 +57,16 @@ namespace osc {
 
 class Theremin {
 public:
-    Theremin(int sample_rate = 44100, float max_amp = 0.25f)
+    Theremin(int sample_rate = 44100, float max_amp = 0.5f)
         : sample_rate_(sample_rate), max_amp_(max_amp) {
-        worker_ = std::thread([this]{ this->run(); });
+        // Open the audio device synchronously. open_device() sets
+        // backend_ either to a description ("ALSA 44100 Hz") or to a
+        // "silent (...)" diagnostic. If it succeeded, mark ourselves
+        // available and start the streaming worker.
+        if (open_device()) {
+            available_ = true;
+            worker_ = std::thread([this]{ this->stream_loop(); });
+        }
     }
 
     ~Theremin() { stop(); }
@@ -84,6 +85,7 @@ public:
     void stop() {
         if (running_.exchange(false)) {
             if (worker_.joinable()) worker_.join();
+            close_device();
         }
     }
 
@@ -106,7 +108,9 @@ private:
         }
     }
 
-    void run();    // platform-specific, defined below
+    bool open_device();    // platform-specific
+    void stream_loop();    // platform-specific
+    void close_device();   // platform-specific
 
     int   sample_rate_;
     float max_amp_;
@@ -118,48 +122,71 @@ private:
     std::string backend_ = "silent";
     float phase_ = 0.0f;
     std::thread worker_;
+
+    // Platform-specific device state.
+#if defined(OSC_AUDIO_ALSA)
+    snd_pcm_t* alsa_pcm_ = nullptr;
+#elif defined(OSC_AUDIO_COREAUDIO)
+    AudioQueueRef       ca_queue_ = nullptr;
+    AudioQueueBufferRef ca_bufs_[3] = {nullptr, nullptr, nullptr};
+#elif defined(OSC_AUDIO_WINMM)
+    HWAVEOUT wm_hw_ = nullptr;
+    static constexpr int kWmFrames = 512;
+    static constexpr int kWmQueue  = 4;
+    std::vector<float> wm_data_;        // sized kWmFrames * kWmQueue
+    WAVEHDR wm_hdr_[kWmQueue]{};
+#endif
 };
 
 // ---------------- ALSA -----------------------------------------------------
 #if defined(OSC_AUDIO_ALSA)
-inline void Theremin::run() {
-    snd_pcm_t* pcm = nullptr;
-    int err = snd_pcm_open(&pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
+inline bool Theremin::open_device() {
+    int err = snd_pcm_open(&alsa_pcm_, "default", SND_PCM_STREAM_PLAYBACK, 0);
     if (err < 0) {
         backend_ = std::string("silent (ALSA open failed: ") +
                    snd_strerror(err) + ")";
-        return;
+        alsa_pcm_ = nullptr;
+        return false;
     }
-    err = snd_pcm_set_params(pcm,
+    err = snd_pcm_set_params(alsa_pcm_,
                              SND_PCM_FORMAT_FLOAT_LE,
                              SND_PCM_ACCESS_RW_INTERLEAVED,
-                             1,                        // channels
+                             1,                  // channels
                              sample_rate_,
-                             1,                        // soft resample
-                             100000);                  // ~100ms latency
+                             1,                  // soft resample
+                             100000);            // ~100ms latency
     if (err < 0) {
         backend_ = std::string("silent (ALSA set_params: ") +
                    snd_strerror(err) + ")";
-        snd_pcm_close(pcm);
-        return;
+        snd_pcm_close(alsa_pcm_);
+        alsa_pcm_ = nullptr;
+        return false;
     }
-    available_ = true;
-    backend_   = "ALSA " + std::to_string(sample_rate_) + " Hz";
+    backend_ = "ALSA " + std::to_string(sample_rate_) + " Hz";
+    return true;
+}
 
+inline void Theremin::stream_loop() {
     constexpr int kFrames = 512;
     std::vector<float> buf(kFrames);
     while (running_.load()) {
         fill(buf.data(), kFrames);
-        snd_pcm_sframes_t n = snd_pcm_writei(pcm, buf.data(), kFrames);
-        if (n < 0) snd_pcm_recover(pcm, static_cast<int>(n), 1);
+        snd_pcm_sframes_t n = snd_pcm_writei(alsa_pcm_, buf.data(), kFrames);
+        if (n < 0) snd_pcm_recover(alsa_pcm_, static_cast<int>(n), 1);
     }
-    snd_pcm_drain(pcm);
-    snd_pcm_close(pcm);
+}
+
+inline void Theremin::close_device() {
+    if (alsa_pcm_) {
+        snd_pcm_drain(alsa_pcm_);
+        snd_pcm_close(alsa_pcm_);
+        alsa_pcm_ = nullptr;
+    }
 }
 
 // ---------------- CoreAudio (macOS) ---------------------------------------
 #elif defined(OSC_AUDIO_COREAUDIO)
-inline void Theremin::run() {
+inline bool Theremin::open_device() {
     AudioStreamBasicDescription fmt{};
     fmt.mSampleRate       = sample_rate_;
     fmt.mFormatID         = kAudioFormatLinearPCM;
@@ -171,7 +198,6 @@ inline void Theremin::run() {
     fmt.mBytesPerFrame    = 4;
     fmt.mBytesPerPacket   = 4;
 
-    AudioQueueRef q = nullptr;
     auto cb = [](void* user, AudioQueueRef qq, AudioQueueBufferRef b) {
         auto* self = static_cast<Theremin*>(user);
         int frames = b->mAudioDataBytesCapacity / sizeof(float);
@@ -179,85 +205,102 @@ inline void Theremin::run() {
         b->mAudioDataByteSize = frames * sizeof(float);
         if (self->running_.load()) AudioQueueEnqueueBuffer(qq, b, 0, nullptr);
     };
-    if (AudioQueueNewOutput(&fmt, cb, this, nullptr, nullptr, 0, &q) != 0) {
+
+    if (AudioQueueNewOutput(&fmt, cb, this, nullptr, nullptr, 0, &ca_queue_) != 0) {
         backend_ = "silent (CoreAudio AudioQueueNewOutput failed)";
-        return;
+        ca_queue_ = nullptr;
+        return false;
     }
-    AudioQueueBufferRef bufs[3] = {nullptr, nullptr, nullptr};
-    for (auto& b : bufs) {
-        AudioQueueAllocateBuffer(q, 512 * sizeof(float), &b);
+    for (auto& b : ca_bufs_) {
+        AudioQueueAllocateBuffer(ca_queue_, 512 * sizeof(float), &b);
         b->mAudioDataByteSize = 512 * sizeof(float);
         std::memset(b->mAudioData, 0, b->mAudioDataByteSize);
-        AudioQueueEnqueueBuffer(q, b, 0, nullptr);
+        AudioQueueEnqueueBuffer(ca_queue_, b, 0, nullptr);
     }
-    AudioQueueStart(q, nullptr);
-    available_ = true;
-    backend_   = "CoreAudio " + std::to_string(sample_rate_) + " Hz";
+    AudioQueueStart(ca_queue_, nullptr);
+    backend_ = "CoreAudio " + std::to_string(sample_rate_) + " Hz";
+    return true;
+}
 
+inline void Theremin::stream_loop() {
+    // CoreAudio's AudioQueue runs the audio callback on its own thread;
+    // this worker just keeps the streaming context alive until stop().
     while (running_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    AudioQueueStop(q, true);
-    AudioQueueDispose(q, true);
+}
+
+inline void Theremin::close_device() {
+    if (ca_queue_) {
+        AudioQueueStop(ca_queue_, true);
+        AudioQueueDispose(ca_queue_, true);
+        ca_queue_ = nullptr;
+        for (auto& b : ca_bufs_) b = nullptr;
+    }
 }
 
 // ---------------- WinMM (Windows) -----------------------------------------
 #elif defined(OSC_AUDIO_WINMM)
-inline void Theremin::run() {
+inline bool Theremin::open_device() {
     WAVEFORMATEX fmt{};
-    fmt.wFormatTag     = WAVE_FORMAT_IEEE_FLOAT;
-    fmt.nChannels      = 1;
-    fmt.nSamplesPerSec = sample_rate_;
-    fmt.wBitsPerSample = 32;
-    fmt.nBlockAlign    = 4;
-    fmt.nAvgBytesPerSec= sample_rate_ * 4;
-    HWAVEOUT hw = nullptr;
-    if (waveOutOpen(&hw, WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+    fmt.wFormatTag      = WAVE_FORMAT_IEEE_FLOAT;
+    fmt.nChannels       = 1;
+    fmt.nSamplesPerSec  = sample_rate_;
+    fmt.wBitsPerSample  = 32;
+    fmt.nBlockAlign     = 4;
+    fmt.nAvgBytesPerSec = sample_rate_ * 4;
+    if (waveOutOpen(&wm_hw_, WAVE_MAPPER, &fmt, 0, 0, CALLBACK_NULL)
+            != MMSYSERR_NOERROR) {
         backend_ = "silent (waveOutOpen failed)";
-        return;
+        wm_hw_ = nullptr;
+        return false;
     }
-    available_ = true;
-    backend_   = "WinMM " + std::to_string(sample_rate_) + " Hz";
+    wm_data_.assign(static_cast<size_t>(kWmFrames) * kWmQueue, 0.0f);
+    for (int i = 0; i < kWmQueue; ++i) {
+        wm_hdr_[i] = WAVEHDR{};
+        wm_hdr_[i].lpData         = reinterpret_cast<LPSTR>(
+                                        wm_data_.data() + i * kWmFrames);
+        wm_hdr_[i].dwBufferLength = kWmFrames * sizeof(float);
+        waveOutPrepareHeader(wm_hw_, &wm_hdr_[i], sizeof(WAVEHDR));
+    }
+    backend_ = "WinMM " + std::to_string(sample_rate_) + " Hz";
+    return true;
+}
 
-    constexpr int kFrames = 512;
-    constexpr int kQueue  = 4;
-    std::vector<float> data(kFrames * kQueue);
-    WAVEHDR hdr[kQueue]{};
-    for (int i = 0; i < kQueue; ++i) {
-        hdr[i].lpData         = reinterpret_cast<LPSTR>(data.data() + i * kFrames);
-        hdr[i].dwBufferLength = kFrames * sizeof(float);
-        waveOutPrepareHeader(hw, &hdr[i], sizeof(WAVEHDR));
-    }
+inline void Theremin::stream_loop() {
     int idx = 0;
     while (running_.load()) {
-        WAVEHDR& h = hdr[idx];
-        // Wait for this slot to be free
+        WAVEHDR& h = wm_hdr_[idx];
         while (running_.load() && (h.dwFlags & WHDR_INQUEUE)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
         if (!running_.load()) break;
-        fill(reinterpret_cast<float*>(h.lpData), kFrames);
+        fill(reinterpret_cast<float*>(h.lpData), kWmFrames);
         h.dwFlags &= ~WHDR_DONE;
-        waveOutWrite(hw, &h, sizeof(WAVEHDR));
-        idx = (idx + 1) % kQueue;
+        waveOutWrite(wm_hw_, &h, sizeof(WAVEHDR));
+        idx = (idx + 1) % kWmQueue;
     }
-    waveOutReset(hw);
-    for (int i = 0; i < kQueue; ++i) waveOutUnprepareHeader(hw, &hdr[i], sizeof(WAVEHDR));
-    waveOutClose(hw);
+}
+
+inline void Theremin::close_device() {
+    if (wm_hw_) {
+        waveOutReset(wm_hw_);
+        for (int i = 0; i < kWmQueue; ++i) {
+            waveOutUnprepareHeader(wm_hw_, &wm_hdr_[i], sizeof(WAVEHDR));
+        }
+        waveOutClose(wm_hw_);
+        wm_hw_ = nullptr;
+    }
 }
 
 // ---------------- Silent fallback -----------------------------------------
 #else  // OSC_AUDIO_NONE
-inline void Theremin::run() {
+inline bool Theremin::open_device() {
     backend_ = "silent (no audio backend compiled in)";
-    while (running_.load()) {
-        // Pretend to consume samples so phase advances naturally.
-        float scratch[256];
-        fill(scratch, 256);
-        std::this_thread::sleep_for(std::chrono::milliseconds(
-            256 * 1000 / sample_rate_));
-    }
+    return false;
 }
+inline void Theremin::stream_loop() { /* never started */ }
+inline void Theremin::close_device() {}
 #endif
 
 } // namespace osc
