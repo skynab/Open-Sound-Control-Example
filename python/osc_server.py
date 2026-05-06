@@ -438,14 +438,28 @@ class OscServer:
         else:
             var.set(initial)
 
-        def cb(v):
-            val_lbl.config(text=f"{float(v):.2f}")
-            self._push(address, float(v))
-
+        # Build the Scale FIRST so the trace below isn't fired by the
+        # Scale's internal initialization writes.
         tk.Scale(row, variable=var, from_=lo, to=hi,
                  resolution=(hi - lo) / 200.0,
-                 orient="horizontal", showvalue=False,
-                 command=cb).pack(fill="x", expand=True, side="left", padx=6)
+                 orient="horizontal", showvalue=False
+                 ).pack(fill="x", expand=True, side="left", padx=6)
+
+        # Use a variable trace rather than the Scale's `command=`. Tk's
+        # Scale only fires its command for user mouse drags; for
+        # programmatic `var.set(...)` calls (e.g., the NatNet listener
+        # mapping a rigid body's position into Pitch / Volume) the
+        # command is suppressed and our _push would never run. A write
+        # trace fires for both cases, so the OSC packet goes out
+        # whether the slider was moved by hand or by code.
+        def on_change(*_args, _addr=address, _lbl=val_lbl, _v=var):
+            try:
+                val = float(_v.get())
+            except (TypeError, ValueError, tk.TclError):
+                return
+            _lbl.config(text=f"{val:.2f}")
+            self._push(_addr, val)
+        var.trace_add("write", on_change)
 
 
     # ---- Networking -------------------------------------------------------
